@@ -10,25 +10,38 @@ import hashlib
 import io
 import logging
 import os
+import random
 import time
 from html import escape
 
 import aiosqlite
+from aiohttp import ClientSession, ClientTimeout, web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ContentType, ParseMode
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
-from aiogram.filters import Command, CommandStart
-from aiogram.types import (BufferedInputFile, CallbackQuery,
-                           ChatMemberUpdated, Message)
+from aiogram.filters import Command, CommandObject, CommandStart
+from aiogram.types import (BotCommand, BotCommandScopeAllChatAdministrators,
+                           BotCommandScopeAllPrivateChats,
+                           BotCommandScopeDefault, BufferedInputFile,
+                           CallbackQuery, ChatMemberUpdated, Message)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from PIL import Image, ImageDraw, ImageFont
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
+def _load_env(path: str = ".env"):
+    """Oddiy .env o'qish (qo'shimcha kutubxonasiz)."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    os.environ.setdefault(k.strip(), v.strip().strip("\"'"))
+    except FileNotFoundError:
+        pass
+
+
+_load_env()
 
 TOKEN = os.getenv("BOT_TOKEN", "")
 OWNER_ID = int(os.getenv("OWNER_ID", "7507192517"))
@@ -42,6 +55,15 @@ log = logging.getLogger("bot")
 
 router = Router()
 db: aiosqlite.Connection
+_tasks: set = set()
+
+
+def spawn(coro):
+    """Fon vazifasini GC dan saqlab ishga tushirish."""
+    t = asyncio.create_task(coro)
+    _tasks.add(t)
+    t.add_done_callback(_tasks.discard)
+    return t
 
 # --------------------------------------------------------------------------
 # Xizmat xabarlari turlari
@@ -64,6 +86,7 @@ _SERVICE_NAMES = [
 SERVICE_TYPES = {getattr(ContentType, n) for n in _SERVICE_NAMES
                  if hasattr(ContentType, n)}
 GROUPS = {"group", "supergroup"}
+CHATS = GROUPS | {"channel"}
 
 # --------------------------------------------------------------------------
 # Baza
@@ -79,7 +102,8 @@ CREATE TABLE IF NOT EXISTS chats(
     is_admin INTEGER DEFAULT 0,
     active INTEGER DEFAULT 1,
     deleted INTEGER DEFAULT 0,
-    added_at INTEGER DEFAULT 0
+    added_at INTEGER DEFAULT 0,
+    delay INTEGER DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS errors(id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -92,6 +116,10 @@ async def init_db():
     db = await aiosqlite.connect(DB_PATH)
     db.row_factory = aiosqlite.Row
     await db.executescript(SCHEMA)
+    try:  # eski bazalar uchun
+        await db.execute("ALTER TABLE chats ADD COLUMN delay INTEGER DEFAULT 0")
+    except aiosqlite.OperationalError:
+        pass
     for k, v in (("cleaner", "1"), ("avatar", "1"),
                  ("deleted_total", "0"), ("avatars_total", "0")):
         await db.execute("INSERT OR IGNORE INTO settings VALUES(?,?)", (k, v))
@@ -148,18 +176,23 @@ async def effective(chat_id: int):
 # --------------------------------------------------------------------------
 # Avatar generatsiya (Pillow)
 # --------------------------------------------------------------------------
+# (gradient 1, gradient 2, matn rangi) — yorqin, e'tibor tortadigan ranglar
 PALETTES = [
-    ((255, 94, 98), (255, 153, 102)),
-    ((67, 206, 162), (24, 90, 157)),
-    ((142, 45, 226), (74, 0, 224)),
-    ((17, 153, 142), (56, 239, 125)),
-    ((252, 70, 107), (63, 94, 251)),
-    ((247, 151, 30), (255, 210, 0)),
-    ((0, 198, 255), (0, 114, 255)),
-    ((235, 51, 73), (244, 92, 67)),
+    ((255, 23, 23), (255, 99, 71), (255, 255, 255)),     # qizil
+    ((0, 200, 83), (0, 230, 118), (255, 255, 255)),      # yashil
+    ((0, 112, 255), (0, 200, 255), (255, 255, 255)),     # ko'k
+    ((255, 214, 0), (255, 160, 0), (40, 40, 40)),        # sariq
+    ((170, 0, 255), (224, 64, 251), (255, 255, 255)),    # binafsha
+    ((255, 0, 128), (255, 110, 199), (255, 255, 255)),   # pushti
+    ((0, 229, 255), (0, 176, 255), (30, 30, 30)),        # firuza
+    ((255, 109, 0), (255, 171, 0), (255, 255, 255)),     # to'q sariq
 ]
 FONT_PATHS = [
     "assets/font.ttf",
+    "/system/fonts/Roboto-Bold.ttf",
+    "/system/fonts/Roboto-Regular.ttf",
+    "/system/fonts/DroidSans-Bold.ttf",
+    "/data/data/com.termux/files/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
     "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
     "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
@@ -181,11 +214,10 @@ def _clean_title(title: str) -> str:
     return t or "Group"
 
 
-def make_avatar(title: str) -> bytes:
+def make_avatar(title: str, idx: int) -> bytes:
     S = 640
     title = _clean_title(title)
-    h = int(hashlib.md5(title.encode()).hexdigest(), 16)
-    c1, c2 = PALETTES[h % len(PALETTES)]
+    c1, c2, tc = PALETTES[idx % len(PALETTES)]
 
     img = Image.new("RGB", (S, S))
     d = ImageDraw.Draw(img)
@@ -194,21 +226,17 @@ def make_avatar(title: str) -> bytes:
         col = tuple(int(c1[k] + (c2[k] - c1[k]) * t) for k in range(3))
         d.line([(i, 0), (0, i)], fill=col, width=3)
 
-    # Dekor doiralar
     over = Image.new("RGBA", (S, S), (0, 0, 0, 0))
-    od = ImageDraw.Draw(over)
-    od.ellipse([-120, -120, 300, 300], fill=(255, 255, 255, 38))
-    od.ellipse([380, 400, 780, 800], fill=(255, 255, 255, 30))
-    od.ellipse([S // 2 - 150, 90, S // 2 + 150, 390], fill=(255, 255, 255, 46))
+    ImageDraw.Draw(over).ellipse([S // 2 - 170, 70, S // 2 + 170, 410],
+                                 fill=(255, 255, 255, 50))
     img = Image.alpha_composite(img.convert("RGBA"), over)
     d = ImageDraw.Draw(img)
 
     words = [w for w in title.split() if any(c.isalnum() for c in w)]
     initials = "".join(next((c for c in w if c.isalnum()), "") for w in words[:2]).upper() or "G"
     f_big = _font(150 if len(initials) > 1 else 180)
-    d.text((S // 2, 240), initials, font=f_big, fill="white", anchor="mm")
+    d.text((S // 2, 240), initials, font=f_big, fill=tc, anchor="mm")
 
-    # Sarlavha (maks. 2 qator, markaziy qismda)
     f_t = _font(46)
     maxw = 400
     lines, cur = [], ""
@@ -228,16 +256,28 @@ def make_avatar(title: str) -> bytes:
     for i, ln in enumerate(lines):
         while d.textlength(ln, font=f_t) > maxw and len(ln) > 1:
             ln = ln[:-2] + "…"
-        d.text((S // 2, 420 + i * 58), ln, font=f_t, fill="white", anchor="mm")
+        d.text((S // 2, 420 + i * 58), ln, font=f_t, fill=tc, anchor="mm")
 
     buf = io.BytesIO()
     img.convert("RGB").save(buf, "PNG", optimize=True)
     return buf.getvalue()
 
 
+async def pick_color(chat_id: int) -> int:
+    """Oxirgisidan farq qiladigan tasodifiy rang."""
+    key = f"lc:{chat_id}"
+    async with db.execute("SELECT value FROM settings WHERE key=?", (key,)) as c:
+        r = await c.fetchone()
+    last = int(r["value"]) if r else -1
+    idx = random.choice([i for i in range(len(PALETTES)) if i != last])
+    await set_setting(key, str(idx))
+    return idx
+
+
 async def set_group_avatar(bot: Bot, chat_id: int, title: str) -> tuple[bool, str]:
     try:
-        data = await asyncio.to_thread(make_avatar, title)
+        idx = await pick_color(chat_id)
+        data = await asyncio.to_thread(make_avatar, title, idx)
         await bot.set_chat_photo(chat_id, BufferedInputFile(data, "avatar.png"))
     except TelegramAPIError as e:
         await log_error(f"avatar {chat_id}: {e}")
@@ -261,7 +301,7 @@ async def notify_owner(bot: Bot, text: str):
 # --------------------------------------------------------------------------
 # Guruh: tozalash va avatar (guruhda hech narsa yozilmaydi)
 # --------------------------------------------------------------------------
-@router.my_chat_member(F.chat.type.in_(GROUPS))
+@router.my_chat_member(F.chat.type.in_(CHATS))
 async def on_bot_status(u: ChatMemberUpdated, bot: Bot):
     chat, new = u.chat, u.new_chat_member
     if new.status in ("left", "kicked"):
@@ -291,6 +331,7 @@ async def on_bot_status(u: ChatMemberUpdated, bot: Bot):
 
 
 @router.message(F.chat.type.in_(GROUPS), F.content_type.in_(SERVICE_TYPES))
+@router.channel_post(F.chat.type == "channel", F.content_type.in_(SERVICE_TYPES))
 async def clean_service(m: Message, bot: Bot):
     if m.migrate_to_chat_id:  # oddiy guruh -> supergroup
         try:
@@ -305,21 +346,105 @@ async def clean_service(m: Message, bot: Bot):
     _, cleaner_on, avatar_on = await effective(m.chat.id)
 
     if cleaner_on:
-        try:
-            await m.delete()
-            await db.execute("UPDATE chats SET deleted=deleted+1 WHERE chat_id=?",
-                             (m.chat.id,))
-            await db.commit()
-            await incr_setting("deleted_total")
-        except TelegramBadRequest as e:
-            await log_error(f"delete {m.chat.id}: {e}")
-        except TelegramAPIError as e:
-            await log_error(f"delete {m.chat.id}: {e}")
+        delay = int(row["delay"] or 0) if row else 0
+        if delay > 0:
+            spawn(delayed_delete(m, delay))
+        else:
+            await delete_counted(m)
 
     # Guruh nomi o'zgarsa va yoqilgan bo'lsa — yangi avatar
     if m.new_chat_title and avatar_on and row and row["rename"]:
         await ensure_chat(m.chat.id, m.new_chat_title)
         await set_group_avatar(bot, m.chat.id, m.new_chat_title)
+
+
+async def delete_counted(m: Message):
+    try:
+        await m.delete()
+    except TelegramAPIError as e:
+        if "not found" not in str(e).lower():
+            await log_error(f"delete {m.chat.id}: {e}")
+        return
+    await db.execute("UPDATE chats SET deleted=deleted+1 WHERE chat_id=?", (m.chat.id,))
+    await db.commit()
+    await incr_setting("deleted_total")
+
+
+async def delayed_delete(m: Message, delay: int):
+    await asyncio.sleep(delay)
+    await delete_counted(m)
+
+
+# --------------------------------------------------------------------------
+# Adminlar uchun buyruqlar: /start va /photo (guruh va kanal)
+# --------------------------------------------------------------------------
+async def is_chat_admin(m: Message, bot: Bot) -> bool:
+    if m.chat.type == "channel":
+        return True  # kanalga faqat adminlar yozadi
+    if m.sender_chat and m.sender_chat.id == m.chat.id:
+        return True  # anonim admin
+    if not m.from_user:
+        return False
+    try:
+        mem = await bot.get_chat_member(m.chat.id, m.from_user.id)
+    except TelegramAPIError:
+        return False
+    return mem.status in ("creator", "administrator")
+
+
+async def flash(bot: Bot, chat_id: int, text: str, secs: int = 6):
+    """Qisqa xabar, bir necha soniyadan keyin o'zi o'chadi."""
+    try:
+        msg = await bot.send_message(chat_id, text)
+    except TelegramAPIError:
+        return
+
+    async def _rm():
+        await asyncio.sleep(secs)
+        try:
+            await msg.delete()
+        except TelegramAPIError:
+            pass
+    spawn(_rm())
+
+
+@router.message(F.chat.type.in_(GROUPS), Command("start", "photo"))
+@router.channel_post(F.chat.type == "channel", Command("start", "photo"))
+async def admin_cmd(m: Message, bot: Bot, command: CommandObject):
+    if not await is_chat_admin(m, bot):
+        return  # oddiy a'zolarga hech narsa qilinmaydi
+    try:
+        await m.delete()
+    except TelegramAPIError:
+        pass
+    chat = m.chat
+    await ensure_chat(chat.id, chat.title)
+
+    if command.command == "start":
+        await db.execute("UPDATE chats SET cleaner=1 WHERE chat_id=?", (chat.id,))
+        await db.commit()
+        ok = False
+        try:
+            me = await bot.get_chat_member(chat.id, bot.id)
+            ok = me.status == "administrator" and bool(getattr(me, "can_delete_messages", False))
+        except TelegramAPIError:
+            pass
+        await flash(bot, chat.id,
+                    "✅ Tozalash yoqildi. Doim tayyor." if ok else
+                    "⚠️ Meni admin qiling va «Xabarlarni o'chirish» huquqini bering.")
+    else:
+        ok, _ = await set_group_avatar(bot, chat.id, chat.title or "")
+        if not ok:
+            await flash(bot, chat.id,
+                        "⚠️ Rasm qo'yilmadi. Menga «Guruh ma'lumotlarini o'zgartirish» huquqini bering.", 8)
+
+
+@router.message(F.chat.type == "private", CommandStart())
+async def private_start(m: Message):
+    await m.answer("👋 Meni guruh yoki kanalga qo'shib, <b>admin</b> qiling.\n\n"
+                   "Guruh/kanal adminlari uchun:\n"
+                   "/start — kirdi-chiqdi xabarlarini tozalash\n"
+                   "/photo — yangi rasm qo'yish")
 
 
 # --------------------------------------------------------------------------
@@ -505,9 +630,11 @@ async def group_view(bot: Bot, chat_id: int, page: int):
     b.button(text=f"{ICON[str(row['avatar'])]} Avatar", callback_data=f"t:{chat_id}:avatar:{page}")
     b.button(text=f"{ICON[str(row['rename'])]} Nom o'zgarsa yangi avatar",
              callback_data=f"t:{chat_id}:rename:{page}")
+    b.button(text=f"⏱ O'chirish kechikishi: {row['delay'] or 0}s",
+             callback_data=f"t:{chat_id}:delay:{page}")
     b.button(text="🖼 Avatarni hozir yaratish", callback_data=f"ra:{chat_id}:{page}")
     b.button(text="⬅️ Orqaga", callback_data=f"gs:{page}")
-    b.adjust(2, 1, 1, 1)
+    b.adjust(2, 1, 1, 1, 1)
     text = (f"👥 <b>{escape(row['title'] or str(chat_id))}</b>\n"
             f"<code>{chat_id}</code>\n\n{perm}\n"
             f"🧹 O'chirilgan: <b>{row['deleted']}</b>\n"
@@ -524,7 +651,12 @@ async def cb_group(cb: CallbackQuery, bot: Bot):
 @owner.callback_query(F.data.startswith("t:"))
 async def cb_group_toggle(cb: CallbackQuery, bot: Bot):
     _, cid, field, page = cb.data.split(":")
-    if field in ("cleaner", "avatar", "rename"):
+    if field == "delay":
+        row = await get_chat(int(cid))
+        nxt = {0: 5, 5: 10, 10: 20}.get(int(row["delay"] or 0), 0)
+        await db.execute("UPDATE chats SET delay=? WHERE chat_id=?", (nxt, int(cid)))
+        await db.commit()
+    elif field in ("cleaner", "avatar", "rename"):
         await db.execute(f"UPDATE chats SET {field}=1-{field} WHERE chat_id=?", (int(cid),))
         await db.commit()
     await safe_edit(cb, *await group_view(bot, int(cid), int(page)))
@@ -540,6 +672,54 @@ async def cb_regen(cb: CallbackQuery, bot: Bot):
 
 
 # --------------------------------------------------------------------------
+async def setup_commands(bot: Bot):
+    """'/' menyusi: guruhda faqat adminlarga ko'rinadi."""
+    try:
+        await bot.delete_my_commands(scope=BotCommandScopeDefault())
+        await bot.set_my_commands(
+            [BotCommand(command="start", description="Tozalashni yoqish"),
+             BotCommand(command="photo", description="Yangi rasm qo'yish")],
+            scope=BotCommandScopeAllChatAdministrators())
+        await bot.set_my_commands(
+            [BotCommand(command="start", description="Boshlash")],
+            scope=BotCommandScopeAllPrivateChats())
+    except TelegramAPIError as e:
+        await log_error(f"commands: {e}")
+
+
+async def health_server():
+    """Render (Web Service) port kutadi; tashqi ping ham shu yerga uradi."""
+    port = os.getenv("PORT")
+    if not port:
+        return None
+
+    async def ok(_):
+        return web.Response(text="ok")
+    app = web.Application()
+    app.router.add_get("/", ok)
+    app.router.add_get("/health", ok)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", int(port)).start()
+    log.info("Health server: port %s", port)
+    return runner
+
+
+async def keep_alive():
+    """Render bepul rejasi 15 daqiqada uxlamasligi uchun o'ziga ping."""
+    url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("SELF_URL")
+    if not url:
+        return
+    while True:
+        await asyncio.sleep(540)
+        try:
+            async with ClientSession(timeout=ClientTimeout(total=20)) as sess:
+                async with sess.get(url) as r:
+                    await r.read()
+        except Exception as e:  # noqa
+            log.warning("keep_alive: %r", e)
+
+
 async def main():
     if not TOKEN:
         raise SystemExit("BOT_TOKEN topilmadi (.env faylni tekshiring)")
@@ -548,10 +728,15 @@ async def main():
     dp = Dispatcher()
     dp.include_routers(owner, router)
     log.info("Bot ishga tushdi. Owner: %s", OWNER_ID)
+    runner = await health_server()
+    spawn(keep_alive())
+    await setup_commands(bot)
     try:
         await bot.delete_webhook(drop_pending_updates=False)
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
+        if runner:
+            await runner.cleanup()
         await db.close()
         await bot.session.close()
 
