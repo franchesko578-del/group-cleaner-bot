@@ -6,9 +6,13 @@ Group Cleaner + Auto Avatar bot  (Python 3.10+, aiogram 3, SQLite, Pillow)
 - Sozlamalar faqat OWNER uchun (private chatdagi panel).
 """
 import asyncio
+import colorsys
+import functools
 import hashlib
 import io
+import itertools
 import logging
+import math
 import os
 import random
 import time
@@ -26,7 +30,7 @@ from aiogram.types import (BotCommand, BotCommandScopeAllChatAdministrators,
                            BotCommandScopeDefault, BufferedInputFile,
                            CallbackQuery, ChatMemberUpdated, Message)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont, ImageOps
 
 def _load_env(path: str = ".env"):
     """Oddiy .env o'qish (qo'shimcha kutubxonasiz)."""
@@ -176,31 +180,38 @@ async def effective(chat_id: int):
 # --------------------------------------------------------------------------
 # Avatar generatsiya (Pillow)
 # --------------------------------------------------------------------------
-# (gradient 1, gradient 2, matn rangi) — yorqin, e'tibor tortadigan ranglar
-PALETTES = [
-    ((255, 23, 23), (255, 99, 71), (255, 255, 255)),     # qizil
-    ((0, 200, 83), (0, 230, 118), (255, 255, 255)),      # yashil
-    ((0, 112, 255), (0, 200, 255), (255, 255, 255)),     # ko'k
-    ((255, 214, 0), (255, 160, 0), (40, 40, 40)),        # sariq
-    ((170, 0, 255), (224, 64, 251), (255, 255, 255)),    # binafsha
-    ((255, 0, 128), (255, 110, 199), (255, 255, 255)),   # pushti
-    ((0, 229, 255), (0, 176, 255), (30, 30, 30)),        # firuza
-    ((255, 109, 0), (255, 171, 0), (255, 255, 255)),     # to'q sariq
+# ==========================================================================
+# Avatar generatsiya (Pillow): tasodifiy fon + har doim bir xil neon/3D matn
+# ==========================================================================
+AV = 800                  # kvadrat rasm o'lchami (1:1)
+SAFE_R = AV * 0.40        # doira ichidagi xavfsiz radius: matn shundan chiqmaydi
+SHEAR = 0.20              # kursiv qiyaligi
+
+# Mavzu ranglari (hue): ko'k, havorang, qizil, yashil, binafsha, to'q sariq, firuza, pushti
+THEME_HUES = [0.60, 0.54, 0.99, 0.36, 0.76, 0.07, 0.49, 0.89]
+
+FONT_FILE = os.path.join("assets", "RussoOne-Regular.ttf")
+FONT_URLS = [
+    "https://github.com/google/fonts/raw/main/ofl/russoone/RussoOne-Regular.ttf",
+    "https://raw.githubusercontent.com/google/fonts/main/ofl/russoone/RussoOne-Regular.ttf",
 ]
 FONT_PATHS = [
-    "assets/font.ttf",
-    "/system/fonts/Roboto-Bold.ttf",
-    "/system/fonts/Roboto-Regular.ttf",
-    "/system/fonts/DroidSans-Bold.ttf",
-    "/data/data/com.termux/files/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+    "assets/font.ttf",          # xohlasangiz o'z shriftingizni shu yerga qo'ying
+    FONT_FILE,
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
     "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+    "/system/fonts/Roboto-Black.ttf",
+    "/system/fonts/Roboto-Bold.ttf",
+    "/system/fonts/Roboto-Regular.ttf",
+    "/data/data/com.termux/files/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
     "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
     "C:/Windows/Fonts/arialbd.ttf",
 ]
 
 
+@functools.lru_cache(maxsize=128)
 def _font(size: int):
+    size = max(10, int(size))
     for p in FONT_PATHS:
         try:
             return ImageFont.truetype(p, size)
@@ -209,57 +220,289 @@ def _font(size: int):
     return ImageFont.load_default(size=size)
 
 
-def _clean_title(title: str) -> str:
-    t = "".join(ch for ch in (title or "") if ord(ch) <= 0xFFFF).strip()
-    return t or "Group"
+def _hsv(h, s, v):
+    r, g, b = colorsys.hsv_to_rgb(h % 1.0, s, v)
+    return int(r * 255), int(g * 255), int(b * 255)
+
+
+def _theme(idx: int) -> dict:
+    h = THEME_HUES[idx % len(THEME_HUES)]
+    return {
+        "dark": _hsv(h, .95, .20), "mid": _hsv(h, .95, .72),
+        "light": _hsv(h, .45, 1.0), "glow": _hsv(h, .85, 1.0),
+        "extr": _hsv(h, 1.0, .48), "top": (255, 255, 255),
+        "bottom": _hsv(h, .20, .97),
+    }
+
+
+def _soft(mask, radius):
+    """Tez Gaussian blur (katta radius uchun kichraytirib bluraymiz)."""
+    if radius < 6:
+        return mask.filter(ImageFilter.GaussianBlur(radius))
+    k = 4
+    small = mask.resize((mask.width // k, mask.height // k), Image.Resampling.BILINEAR)
+    small = small.filter(ImageFilter.GaussianBlur(radius / k))
+    return small.resize(mask.size, Image.Resampling.BICUBIC)
+
+
+def _paint(img, color, mask, gain=1.0):
+    if gain != 1.0:
+        mask = mask.point(lambda v: min(255, int(v * gain)))
+    img.paste(color, mask=mask)
+
+
+# ---------------------------- FONLAR ----------------------------------------
+def _bg_base(t):
+    c1, c2 = (t["dark"], t["mid"]) if random.random() < .5 else (t["mid"], t["dark"])
+    img = Image.new("RGB", (AV, AV))
+    d = ImageDraw.Draw(img)
+    for i in range(2 * AV):
+        f = i / (2 * AV)
+        d.line([(i, 0), (0, i)], width=3,
+               fill=tuple(int(c1[k] + (c2[k] - c1[k]) * f) for k in range(3)))
+    if random.random() < .5:
+        img = ImageOps.mirror(img)
+    if random.random() < .5:
+        img = ImageOps.flip(img)
+    return img
+
+
+def _smoke(img, t, strength=.6):
+    R = Image.Resampling.BICUBIC
+    a = Image.effect_noise((5, 5), 100).resize((AV, AV), R)
+    b = Image.effect_noise((11, 11), 100).resize((AV, AV), R)
+    c = Image.effect_noise((23, 23), 100).resize((AV, AV), R)
+    m = Image.blend(Image.blend(a, b, .45), c, .3)
+    m = _soft(m.point(lambda v: max(0, min(255, int((v - 110) * 2.6)))), 34)
+    _paint(img, t["dark"], ImageOps.invert(m), .45)
+    _paint(img, t["glow"], m, strength)
+
+
+def _style_smoke(img, t):
+    _smoke(img, t, 1.0)
+
+
+def _style_bands(img, t):
+    lay = Image.new("RGBA", (AV, AV), (0, 0, 0, 0))
+    d = ImageDraw.Draw(lay)
+    edge = Image.new("L", (AV, AV), 0)
+    e = ImageDraw.Draw(edge)
+    o = random.randint(40, 120)
+    for _ in range(random.randint(3, 5)):
+        b = o + random.randint(25, 90)
+        d.polygon([(0, o), (o, 0), (b, 0), (0, b)],
+                  fill=(*t["mid"], random.randint(70, 150)))
+        e.line([(0, o), (o, 0)], fill=255, width=3)
+        o = b + random.randint(10, 60)
+    lay = Image.alpha_composite(lay, lay.rotate(180))
+    edge = ImageChops.lighter(edge, edge.rotate(180))
+    img.paste(lay.convert("RGB"), mask=lay.getchannel("A"))
+    _paint(img, t["glow"], _soft(edge, 8), 2.0)
+    _paint(img, t["light"], edge)
+
+
+def _style_beams(img, t):
+    core = Image.new("L", (AV, AV), 0)
+    d = ImageDraw.Draw(core)
+    sgn = random.choice([-1, 1])
+    for _ in range(random.randint(3, 6)):
+        x0 = random.randint(-AV // 2, int(AV * 1.1))
+        d.line([(x0, -60), (x0 + sgn * (AV + 120), AV + 60)],
+               fill=255, width=random.choice([3, 5, 8, 14]))
+    _paint(img, t["glow"], _soft(core, 26), 1.6)
+    _paint(img, t["glow"], _soft(core, 8), 1.8)
+    _paint(img, t["light"], core)
+
+
+def _style_waves(img, t):
+    lay = Image.new("RGBA", (AV, AV), (0, 0, 0, 0))
+    d = ImageDraw.Draw(lay)
+    edge = Image.new("L", (AV, AV), 0)
+    e = ImageDraw.Draw(edge)
+    for _ in range(random.randint(4, 6)):
+        base = random.randint(0, AV)
+        amp = random.randint(40, 120)
+        f = random.uniform(1.0, 2.2) * 2 * math.pi / AV
+        ph = random.uniform(0, 6.28)
+        tilt = random.uniform(-.4, .4)
+        pts = [(x, base + tilt * x + amp * math.sin(x * f + ph))
+               for x in range(-10, AV + 11, 10)]
+        th = random.randint(30, 90)
+        d.polygon(pts + [(x, y + th) for x, y in reversed(pts)],
+                  fill=(*t["mid"], random.randint(50, 110)))
+        e.line(pts, fill=255, width=3)
+    img.paste(lay.convert("RGB"), mask=lay.getchannel("A"))
+    _paint(img, t["glow"], _soft(edge, 8), 2.0)
+    _paint(img, t["light"], edge, .8)
+
+
+def _style_rays(img, t):
+    lay = Image.new("L", (AV, AV), 0)
+    d = ImageDraw.Draw(lay)
+    ox, oy = random.choice([(-60, -60), (AV + 60, -60), (-60, AV + 60), (AV + 60, AV + 60)])
+    base = math.atan2(AV / 2 - oy, AV / 2 - ox)
+    for _ in range(random.randint(7, 11)):
+        a = base + random.uniform(-.8, .8)
+        w = random.uniform(.02, .08)
+        d.polygon([(ox, oy),
+                   (ox + 3 * AV * math.cos(a - w), oy + 3 * AV * math.sin(a - w)),
+                   (ox + 3 * AV * math.cos(a + w), oy + 3 * AV * math.sin(a + w))],
+                  fill=random.randint(60, 150))
+    _paint(img, t["light"], _soft(lay, 3), .6)
+
+
+BG_STYLES = [_style_smoke, _style_bands, _style_beams, _style_waves, _style_rays]
+
+
+def _make_bg(t):
+    img = _bg_base(t)
+    style = random.choice(BG_STYLES)
+    style(img, t)
+    if style is not _style_smoke and random.random() < .6:
+        _smoke(img, t, .5)
+    return img
+
+
+# ---------------------------- MATN ------------------------------------------
+def _prep_title(title: str) -> str:
+    t = "".join(ch for ch in (title or "") if ord(ch) <= 0xFFFF)
+    for a in "ʻʼ‘’`´":
+        t = t.replace(a, "'")
+    t = " ".join(t.split()).upper()
+    if len(t) > 36:
+        cut = t[:36]
+        t = cut.rsplit(" ", 1)[0] if " " in cut else cut
+    return t or "GROUP"
+
+
+def _split_lines(text: str) -> list:
+    """Nomni 1–3 ta muvozanatli qatorga ajratadi."""
+    words = text.split()
+    total = len(text)
+    k = min(1 if total <= 6 else 2 if total <= 12 else 3, len(words))
+    if k <= 1:
+        return [" ".join(words)]
+    best, best_score = None, None
+    for cuts in itertools.combinations(range(1, len(words)), k - 1):
+        idx = (0, *cuts, len(words))
+        ls = [" ".join(words[idx[i]:idx[i + 1]]) for i in range(k)]
+        lens = [len(x) for x in ls]
+        score = max(lens) * 100 + (max(lens) - min(lens))
+        if best_score is None or score < best_score:
+            best, best_score = ls, score
+    return best
+
+
+def _inside(it) -> bool:
+    """Qatorning (kursiv + 3D soya bilan) barcha burchaklari xavfsiz doira ichidami."""
+    depth = it["size"] * .05
+    hw, hh = it["w"] / 2, it["h"] / 2
+    sh = SHEAR * hh
+    cx, cy = AV / 2, it["cy"]
+    pts = [(cx - hw + sh, cy - hh), (cx + hw + sh, cy - hh),
+           (cx - hw - sh - depth * .4, cy + hh + depth), (cx + hw - sh, cy + hh + depth)]
+    return all(math.hypot(x - AV / 2, y - AV / 2) <= SAFE_R for x, y in pts)
+
+
+def _fit_layout(lines: list) -> list:
+    n = len(lines)
+    base = {1: .42, 2: .31, 3: .24}.get(n, .2) * AV
+    caps = [base] * n
+    if n == 3:
+        caps[1] = base * .8
+    sizes = []
+    for ln, cap in zip(lines, caps):
+        bb = _font(100).getbbox(ln, anchor="ls", stroke_width=2)
+        sizes.append(min(cap, AV * (.78 if n == 1 else .72) * 100 / max(bb[2] - bb[0], 1)))
+
+    items = []
+    for _ in range(90):
+        items = []
+        for ln, sz in zip(lines, sizes):
+            f = _font(sz)
+            sw = max(2, int(sz * .022))
+            l, tp, r, b = f.getbbox(ln, anchor="ls", stroke_width=sw)
+            items.append({"text": ln, "font": f, "sw": sw, "l": l, "t": tp, "r": r,
+                          "b": b, "w": r - l, "h": b - tp, "size": sz})
+        gap = .11 * sum(i["h"] for i in items) / n
+        y = AV / 2 - (sum(i["h"] for i in items) + gap * (n - 1)) / 2
+        for it in items:
+            it["cy"] = y + it["h"] / 2
+            y += it["h"] + gap
+        bad = False
+        for i, it in enumerate(items):
+            if not _inside(it):
+                sizes[i] *= .95
+                bad = True
+        if not bad:
+            break
+    return items
+
+
+def _streaks(img, t, items):
+    """Qatorlar orasida yorug' neon chiziqlar (faqat 2+ qator bo'lsa)."""
+    if len(items) < 2:
+        return
+    core = Image.new("L", (AV, AV), 0)
+    d = ImageDraw.Draw(core)
+    half, steps = AV * .46, 80
+    for a, b in zip(items, items[1:]):
+        y = ((a["cy"] + a["h"] / 2) + (b["cy"] - b["h"] / 2)) / 2
+        seg = 2 * half / steps
+        for i in range(steps):
+            f = 1 - abs((i + .5) / steps * 2 - 1)
+            x = AV / 2 - half + i * seg
+            d.rectangle([x, y - 1, x + seg + 1, y + 1], fill=int(255 * f ** .6))
+    _paint(img, t["glow"], _soft(core, 18), 1.2)
+    _paint(img, t["glow"], _soft(core, 6), 1.8)
+    _paint(img, t["light"], core)
 
 
 def make_avatar(title: str, idx: int) -> bytes:
-    S = 640
-    title = _clean_title(title)
-    c1, c2, tc = PALETTES[idx % len(PALETTES)]
+    t = _theme(idx)
+    img = _make_bg(t)
+    items = _fit_layout(_split_lines(_prep_title(title)))
+    _streaks(img, t, items)
 
-    img = Image.new("RGB", (S, S))
-    d = ImageDraw.Draw(img)
-    for i in range(2 * S):
-        t = i / (2 * S)
-        col = tuple(int(c1[k] + (c2[k] - c1[k]) * t) for k in range(3))
-        d.line([(i, 0), (0, i)], fill=col, width=3)
+    # Matn maskasi (kursiv qiyshaytirish bilan)
+    mask = Image.new("L", (AV, AV), 0)
+    d = ImageDraw.Draw(mask)
+    for it in items:
+        cy = it["cy"]
+        ox = AV / 2 - SHEAR * (AV / 2 - cy) - (it["l"] + it["r"]) / 2
+        oy = cy - (it["t"] + it["b"]) / 2
+        d.text((ox, oy), it["text"], font=it["font"], fill=255, anchor="ls",
+               stroke_width=it["sw"], stroke_fill=255)
+    mask = mask.transform((AV, AV), Image.Transform.AFFINE,
+                          (1, SHEAR, -SHEAR * AV / 2, 0, 1, 0),
+                          Image.Resampling.BICUBIC)
 
-    over = Image.new("RGBA", (S, S), (0, 0, 0, 0))
-    ImageDraw.Draw(over).ellipse([S // 2 - 170, 70, S // 2 + 170, 410],
-                                 fill=(255, 255, 255, 50))
-    img = Image.alpha_composite(img.convert("RGBA"), over)
-    d = ImageDraw.Draw(img)
+    avg = sum(i["size"] for i in items) / len(items)
+    depth = max(4, int(avg * .05))
 
-    words = [w for w in title.split() if any(c.isalnum() for c in w)]
-    initials = "".join(next((c for c in w if c.isalnum()), "") for w in words[:2]).upper() or "G"
-    f_big = _font(150 if len(initials) > 1 else 180)
-    d.text((S // 2, 240), initials, font=f_big, fill=tc, anchor="mm")
-
-    f_t = _font(46)
-    maxw = 400
-    lines, cur = [], ""
-    for w in title.split():
-        test = f"{cur} {w}".strip()
-        if d.textlength(test, font=f_t) <= maxw:
-            cur = test
-        else:
-            if cur:
-                lines.append(cur)
-            cur = w
-    if cur:
-        lines.append(cur)
-    if len(lines) > 2:
-        lines = lines[:2]
-        lines[1] = lines[1].rstrip() + "…"
-    for i, ln in enumerate(lines):
-        while d.textlength(ln, font=f_t) > maxw and len(ln) > 1:
-            ln = ln[:-2] + "…"
-        d.text((S // 2, 420 + i * 58), ln, font=f_t, fill=tc, anchor="mm")
+    # 1) neon nur
+    _paint(img, t["glow"], _soft(mask, avg * .30), 1.1)
+    _paint(img, t["glow"], _soft(mask, avg * .09), 1.8)
+    # 2) 3D qalinlik
+    ext = Image.new("L", (AV, AV), 0)
+    for k in range(1, depth + 1):
+        ext = ImageChops.lighter(ext, ImageChops.offset(mask, -int(k * .4), k))
+    _paint(img, t["extr"], ext)
+    # 3) yorqin chekka
+    rim = ImageChops.subtract(mask.filter(ImageFilter.MaxFilter(3 if avg < 150 else 5)), mask)
+    _paint(img, t["light"], rim)
+    # 4) oq → kumush gradient yuza (har qatorda alohida)
+    grad = Image.new("L", (AV, AV), 0)
+    lg = Image.linear_gradient("L")
+    for it in items:
+        h = max(1, int(it["h"]))
+        grad.paste(lg.resize((AV, h)), (0, int(it["cy"] - h / 2)))
+    face = Image.composite(Image.new("RGB", (AV, AV), t["bottom"]),
+                           Image.new("RGB", (AV, AV), t["top"]), grad)
+    img.paste(face, mask=mask)
 
     buf = io.BytesIO()
-    img.convert("RGB").save(buf, "PNG", optimize=True)
+    img.save(buf, "PNG")
     return buf.getvalue()
 
 
@@ -269,9 +512,31 @@ async def pick_color(chat_id: int) -> int:
     async with db.execute("SELECT value FROM settings WHERE key=?", (key,)) as c:
         r = await c.fetchone()
     last = int(r["value"]) if r else -1
-    idx = random.choice([i for i in range(len(PALETTES)) if i != last])
+    idx = random.choice([i for i in range(len(THEME_HUES)) if i != last])
     await set_setting(key, str(idx))
     return idx
+
+
+async def ensure_font():
+    """Qalin sport shriftini (Russo One) bir marta yuklab oladi; bo'lmasa zaxira shrift ishlatiladi."""
+    if os.path.exists(FONT_FILE) and os.path.getsize(FONT_FILE) > 20000:
+        return
+    os.makedirs("assets", exist_ok=True)
+    for url in FONT_URLS:
+        try:
+            async with ClientSession(timeout=ClientTimeout(total=30)) as sess:
+                async with sess.get(url) as r:
+                    if r.status != 200:
+                        continue
+                    data = await r.read()
+            if len(data) > 20000 and data[:4] in (b"\x00\x01\x00\x00", b"OTTO", b"true"):
+                with open(FONT_FILE, "wb") as f:
+                    f.write(data)
+                _font.cache_clear()
+                log.info("Shrift yuklandi: %s", FONT_FILE)
+                return
+        except Exception as e:  # noqa
+            log.warning("font yuklanmadi: %r", e)
 
 
 async def set_group_avatar(bot: Bot, chat_id: int, title: str) -> tuple[bool, str]:
@@ -526,7 +791,7 @@ async def cb_health(cb: CallbackQuery, bot: Bot):
             f"🤖 @{me.username}\n"
             f"✅ Ishlayapti\n"
             f"⏱ Ping: <b>{ping:.0f} ms</b>\n"
-            f"🕒 Uptime: <b>{up // 3600}s {up % 3600 // 60}d</b>")
+            f"🕒 Uptime: <b>{up // 86400} kun {up % 86400 // 3600} soat {up % 3600 // 60} daqiqa</b>")
     await safe_edit(cb, text, back_kb())
 
 
@@ -728,6 +993,7 @@ async def main():
     dp = Dispatcher()
     dp.include_routers(owner, router)
     log.info("Bot ishga tushdi. Owner: %s", OWNER_ID)
+    await ensure_font()
     runner = await health_server()
     spawn(keep_alive())
     await setup_commands(bot)
